@@ -185,7 +185,7 @@ def run_flask():
 # ==================== PRESENCE ====================
 presence_cycle = itertools.cycle([
     "↪ my dino park is peak",
-    "↪ Developer: ¿Brashannn?"
+    "↪ Developer: Supskevv"
 ])
 
 @tasks.loop(seconds=10)

@@ -10,6 +10,7 @@ from flask import Flask
 from threading import Thread
 import itertools
 from motor.motor_asyncio import AsyncIOMotorClient
+import commands as bot_commands   # <-- cargamos los comandos
 
 # ==================== CONFIG ====================
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -53,7 +54,6 @@ async def init_db():
     global mongo_client, db
     mongo_client = AsyncIOMotorClient(MONGO_URI)
     db = mongo_client["mydinobot"]
-    # Test connection
     await db.command("ping")
     print("Successfully connected to MongoDB")
 
@@ -149,7 +149,6 @@ async def get_welcome_config(guild_id: int) -> dict:
     }
 
 async def send_dm_sanction(user: discord.User | discord.Member, title: str, description: str, extra_fields: dict = None):
-    """DM profesional y lógico al usuario"""
     try:
         embed = discord.Embed(
             title=title,
@@ -217,7 +216,6 @@ async def rotate_presence():
 async def check_tempbans_and_locks():
     now = datetime.now(timezone.utc).timestamp()
 
-    # Tempbans
     async for doc in db.tempbans.find({"end_ts": {"$lte": now}}):
         guild = bot.get_guild(doc["guild_id"])
         if not guild:
@@ -234,7 +232,6 @@ async def check_tempbans_and_locks():
             pass
         await db.tempbans.delete_one({"_id": doc["_id"]})
 
-    # Locks
     async for doc in db.locks.find({"end_ts": {"$lte": now}}):
         channel = bot.get_channel(doc["channel_id"])
         if channel and isinstance(channel, discord.TextChannel):
@@ -468,534 +465,6 @@ async def on_member_join(member: discord.Member):
     except Exception:
         pass
 
-# ==================== MODERATION COMMANDS ====================
-@bot.command(name="lock")
-@commands.has_permissions(manage_channels=True)
-@commands.bot_has_permissions(manage_channels=True)
-async def lock(ctx: commands.Context, channel: Optional[discord.TextChannel] = None, time: Optional[str] = None):
-    channel = channel or ctx.channel
-    overwrite = channel.overwrites_for(ctx.guild.default_role)
-    overwrite.send_messages = False
-    await channel.set_permissions(ctx.guild.default_role, overwrite=overwrite, reason=f"Locked by {ctx.author}")
-
-    td = parse_time(time) if time else None
-    if td:
-        end_ts = (datetime.now(timezone.utc) + td).timestamp()
-        await db.locks.update_one(
-            {"channel_id": channel.id},
-            {"$set": {"channel_id": channel.id, "guild_id": ctx.guild.id, "end_ts": end_ts}},
-            upsert=True
-        )
-        msg = f"{EMOJI_ACEPTAR} {channel.mention} has been locked for **{format_timedelta(td)}**."
-    else:
-        await db.locks.delete_one({"channel_id": channel.id})
-        msg = f"{EMOJI_ACEPTAR} {channel.mention} has been locked."
-
-    await ctx.send(msg)
-    await log_action(ctx.guild, f"{EMOJI_AVISO} Channel Locked", {
-        "Channel": channel.mention,
-        "Moderator": ctx.author.mention,
-        "Duration": format_timedelta(td) if td else "Permanent"
-    })
-
-@bot.command(name="unlock")
-@commands.has_permissions(manage_channels=True)
-@commands.bot_has_permissions(manage_channels=True)
-async def unlock(ctx: commands.Context, channel: Optional[discord.TextChannel] = None):
-    channel = channel or ctx.channel
-    overwrite = channel.overwrites_for(ctx.guild.default_role)
-    overwrite.send_messages = None
-    await channel.set_permissions(ctx.guild.default_role, overwrite=overwrite, reason=f"Unlocked by {ctx.author}")
-    await db.locks.delete_one({"channel_id": channel.id})
-    await ctx.send(f"{EMOJI_ACEPTAR} {channel.mention} has been unlocked.")
-    await log_action(ctx.guild, f"{EMOJI_ACEPTAR} Channel Unlocked", {
-        "Channel": channel.mention,
-        "Moderator": ctx.author.mention
-    })
-
-@bot.command(name="ban")
-@commands.has_permissions(ban_members=True)
-@commands.bot_has_permissions(ban_members=True)
-async def ban(ctx: commands.Context, target: str = None, *, reason: str = "No reason provided"):
-    if target is None:
-        return await ctx.send(embed=usage_embed("?ban", "?ban <user> [reason]", "?ban @User Breaking rules"))
-    member = await resolve_member(ctx, target)
-    if member:
-        if not can_moderate(ctx.author, member):
-            await ctx.send(f"{EMOJI_DENEGADO} You cannot ban this user (hierarchy).")
-            return
-        try:
-            await send_dm_sanction(
-                member,
-                f"{EMOJI_DENEGADO} You have been banned",
-                f"You have been **banned** from **{ctx.guild.name}**.\n\n**Reason:** {reason}"
-            )
-            await member.ban(reason=f"{reason} | By {ctx.author}")
-            await ctx.send(f"{EMOJI_ACEPTAR} **{member}** has been banned.\nReason: {reason}")
-        except discord.Forbidden:
-            await ctx.send(f"{EMOJI_DENEGADO} I don't have permission to ban this user.")
-            return
-    else:
-        try:
-            user_id = int(target.strip("<@!>"))
-            user = await bot.fetch_user(user_id)
-            await send_dm_sanction(
-                user,
-                f"{EMOJI_DENEGADO} You have been banned",
-                f"You have been **banned** from **{ctx.guild.name}**.\n\n**Reason:** {reason}"
-            )
-            await ctx.guild.ban(discord.Object(id=user_id), reason=f"{reason} | By {ctx.author}")
-            await ctx.send(f"{EMOJI_ACEPTAR} User `{user_id}` has been banned.\nReason: {reason}")
-        except Exception:
-            await ctx.send(f"{EMOJI_DENEGADO} User not found.")
-            return
-
-    await log_action(ctx.guild, f"{EMOJI_DENEGADO} User Banned", {
-        "User": str(member or target),
-        "Moderator": ctx.author.mention,
-        "Reason": reason
-    })
-
-@bot.command(name="tempban")
-@commands.has_permissions(ban_members=True)
-@commands.bot_has_permissions(ban_members=True)
-async def tempban(ctx: commands.Context, target: str = None, time: str = None, *, reason: str = "No reason provided"):
-    if target is None or time is None:
-        return await ctx.send(embed=usage_embed("?tempban", "?tempban <user> <time> [reason]", "?tempban @User 7d Toxic behavior"))
-    td = parse_time(time)
-    if not td:
-        await ctx.send(f"{EMOJI_DENEGADO} Invalid time format. Use `30s`, `5m`, `2h`, `1d`, `1w`.")
-        return
-
-    member = await resolve_member(ctx, target)
-    user_id = None
-    display = None
-
-    if member:
-        if not can_moderate(ctx.author, member):
-            await ctx.send(f"{EMOJI_DENEGADO} You cannot ban this user (hierarchy).")
-            return
-        user_id = member.id
-        display = str(member)
-        try:
-            await send_dm_sanction(
-                member,
-                f"{EMOJI_ARENA} You have been temporarily banned",
-                f"You have been **temporarily banned** from **{ctx.guild.name}**.\n\n**Duration:** {format_timedelta(td)}\n**Reason:** {reason}"
-            )
-            await member.ban(reason=f"[TEMP {format_timedelta(td)}] {reason} | By {ctx.author}")
-        except discord.Forbidden:
-            await ctx.send(f"{EMOJI_DENEGADO} I don't have permission to ban this user.")
-            return
-    else:
-        try:
-            user_id = int(target.strip("<@!>"))
-            user = await bot.fetch_user(user_id)
-            display = str(user)
-            await send_dm_sanction(
-                user,
-                f"{EMOJI_ARENA} You have been temporarily banned",
-                f"You have been **temporarily banned** from **{ctx.guild.name}**.\n\n**Duration:** {format_timedelta(td)}\n**Reason:** {reason}"
-            )
-            await ctx.guild.ban(discord.Object(id=user_id), reason=f"[TEMP {format_timedelta(td)}] {reason} | By {ctx.author}")
-        except Exception:
-            await ctx.send(f"{EMOJI_DENEGADO} User not found.")
-            return
-
-    end_ts = (datetime.now(timezone.utc) + td).timestamp()
-    await db.tempbans.update_one(
-        {"guild_id": ctx.guild.id, "user_id": user_id},
-        {"$set": {"guild_id": ctx.guild.id, "user_id": user_id, "end_ts": end_ts}},
-        upsert=True
-    )
-
-    await ctx.send(f"{EMOJI_ARENA} **{display}** has been temporarily banned for **{format_timedelta(td)}**.\nReason: {reason}")
-    await log_action(ctx.guild, f"{EMOJI_ARENA} User Temporarily Banned", {
-        "User": display,
-        "Duration": format_timedelta(td),
-        "Moderator": ctx.author.mention,
-        "Reason": reason
-    })
-
-@bot.command(name="unban")
-@commands.has_permissions(ban_members=True)
-@commands.bot_has_permissions(ban_members=True)
-async def unban(ctx: commands.Context, user_id: str = None):
-    if user_id is None:
-        return await ctx.send(embed=usage_embed("?unban", "?unban <user-id>", "?unban 123456789012345678"))
-    try:
-        uid = int(user_id.strip("<@!>"))
-        user = await bot.fetch_user(uid)
-        await ctx.guild.unban(discord.Object(id=uid), reason=f"Unbanned by {ctx.author}")
-
-        await send_dm_sanction(
-            user,
-            f"{EMOJI_ACEPTAR} Your ban has been removed",
-            f"Your ban has been **removed** from **{ctx.guild.name}**.\nYou can now rejoin the server."
-        )
-
-        await db.tempbans.delete_one({"guild_id": ctx.guild.id, "user_id": uid})
-
-        await ctx.send(f"{EMOJI_ACEPTAR} User `{uid}` has been unbanned.")
-        await log_action(ctx.guild, f"{EMOJI_ACEPTAR} User Unbanned", {
-            "User": f"{user} (`{uid}`)",
-            "Moderator": ctx.author.mention
-        })
-    except Exception as e:
-        await ctx.send(f"{EMOJI_DENEGADO} Could not unban: {e}")
-
-@bot.command(name="warn")
-@commands.has_permissions(moderate_members=True)
-async def warn(ctx: commands.Context, target: str = None, *, reason: str = "No reason provided"):
-    if target is None:
-        return await ctx.send(embed=usage_embed("?warn", "?warn <user> [reason]", "?warn @User Spamming"))
-    member = await resolve_member(ctx, target)
-    if not member:
-        await ctx.send(f"{EMOJI_DENEGADO} User not found.")
-        return
-    if not can_moderate(ctx.author, member):
-        await ctx.send(f"{EMOJI_DENEGADO} You cannot warn this user (hierarchy).")
-        return
-
-    # Get current warns count for ID
-    count = await db.warns.count_documents({"guild_id": ctx.guild.id, "user_id": member.id})
-    warn_id = count + 1
-
-    await db.warns.insert_one({
-        "guild_id": ctx.guild.id,
-        "user_id": member.id,
-        "warn_id": warn_id,
-        "reason": reason,
-        "moderator": str(ctx.author),
-        "moderator_id": ctx.author.id,
-        "timestamp": datetime.now(timezone.utc).isoformat()
-    })
-
-    await send_dm_sanction(
-        member,
-        f"{EMOJI_AVISO} You have received a warning",
-        f"You have received a **warning** in **{ctx.guild.name}**.\n\n**Warn ID:** `{warn_id}`\n**Reason:** {reason}"
-    )
-    await ctx.send(f"{EMOJI_AVISO} **{member}** has been warned (ID: `{warn_id}`).\nReason: {reason}")
-    await log_action(ctx.guild, f"{EMOJI_AVISO} User Warned", {
-        "User": member.mention,
-        "Warn ID": str(warn_id),
-        "Moderator": ctx.author.mention,
-        "Reason": reason
-    })
-
-@bot.command(name="warnings")
-@commands.has_permissions(moderate_members=True)
-async def warnings(ctx: commands.Context, target: str = None):
-    if target is None:
-        return await ctx.send(embed=usage_embed("?warnings", "?warnings <user>", "?warnings @User"))
-    member = await resolve_member(ctx, target)
-    if not member:
-        await ctx.send(f"{EMOJI_DENEGADO} User not found.")
-        return
-
-    cursor = db.warns.find({"guild_id": ctx.guild.id, "user_id": member.id}).sort("warn_id", 1)
-    user_warns = await cursor.to_list(length=50)
-
-    if not user_warns:
-        await ctx.send(f"{EMOJI_LUPA} **{member}** has no warnings.")
-        return
-
-    embed = discord.Embed(title=f"{EMOJI_AVISO} Warnings — {member}", color=SYSTEM_COLOR, timestamp=datetime.now(timezone.utc))
-    for w in user_warns:
-        embed.add_field(
-            name=f"Warn ID: `{w['warn_id']}`",
-            value=f"**Reason:** {w['reason']}\n**Moderator:** {w['moderator']}\n**Date:** {w['timestamp'][:19]}",
-            inline=False
-        )
-    embed.set_footer(text="My Dino Park • Moderation")
-    await ctx.send(embed=embed)
-
-@bot.command(name="delwarn")
-@commands.has_permissions(moderate_members=True)
-async def delwarn(ctx: commands.Context, target: str = None, warn_id: int = None):
-    if target is None or warn_id is None:
-        return await ctx.send(embed=usage_embed("?delwarn", "?delwarn <user> <warn-id>", "?delwarn @User 2"))
-    member = await resolve_member(ctx, target)
-    if not member:
-        await ctx.send(f"{EMOJI_DENEGADO} User not found.")
-        return
-
-    result = await db.warns.delete_one({
-        "guild_id": ctx.guild.id,
-        "user_id": member.id,
-        "warn_id": warn_id
-    })
-
-    if result.deleted_count == 0:
-        await ctx.send(f"{EMOJI_DENEGADO} Warn ID not found.")
-        return
-
-    await send_dm_sanction(
-        member,
-        f"{EMOJI_ACEPTAR} Warning removed",
-        f"Your warning **#{warn_id}** has been **removed** from **{ctx.guild.name}**."
-    )
-    await ctx.send(f"{EMOJI_ACEPTAR} Warn `{warn_id}` deleted from **{member}**.")
-    await log_action(ctx.guild, f"{EMOJI_ACEPTAR} Warning Removed", {
-        "User": member.mention,
-        "Warn ID": str(warn_id),
-        "Moderator": ctx.author.mention
-    })
-
-@bot.command(name="note")
-@commands.has_permissions(moderate_members=True)
-async def note(ctx: commands.Context, target: str = None, *, note_text: str = None):
-    if target is None or note_text is None:
-        return await ctx.send(embed=usage_embed("?note", "?note <user> <note>", "?note @User Suspicious behavior"))
-    member = await resolve_member(ctx, target)
-    if not member:
-        await ctx.send(f"{EMOJI_DENEGADO} User not found.")
-        return
-
-    count = await db.notes.count_documents({"guild_id": ctx.guild.id, "user_id": member.id})
-    note_id = count + 1
-
-    await db.notes.insert_one({
-        "guild_id": ctx.guild.id,
-        "user_id": member.id,
-        "note_id": note_id,
-        "note": note_text,
-        "moderator": str(ctx.author),
-        "timestamp": datetime.now(timezone.utc).isoformat()
-    })
-    await ctx.send(f"{EMOJI_PLUMA} Note `{note_id}` added to **{member}**.")
-
-@bot.command(name="viewnotes")
-@commands.has_permissions(moderate_members=True)
-async def viewnotes(ctx: commands.Context, target: str = None):
-    if target is None:
-        return await ctx.send(embed=usage_embed("?viewnotes", "?viewnotes <user>", "?viewnotes @User"))
-    member = await resolve_member(ctx, target)
-    if not member:
-        await ctx.send(f"{EMOJI_DENEGADO} User not found.")
-        return
-
-    cursor = db.notes.find({"guild_id": ctx.guild.id, "user_id": member.id}).sort("note_id", 1)
-    user_notes = await cursor.to_list(length=50)
-
-    if not user_notes:
-        await ctx.send(f"{EMOJI_LUPA} **{member}** has no notes.")
-        return
-
-    embed = discord.Embed(title=f"{EMOJI_PLUMA} Notes — {member}", color=SYSTEM_COLOR, timestamp=datetime.now(timezone.utc))
-    for n in user_notes:
-        embed.add_field(
-            name=f"Note ID: `{n['note_id']}`",
-            value=f"{n['note']}\n*By {n['moderator']} — {n['timestamp'][:19]}*",
-            inline=False
-        )
-    embed.set_footer(text="My Dino Park • Staff Notes")
-    await ctx.send(embed=embed)
-
-@bot.command(name="delnote")
-@commands.has_permissions(moderate_members=True)
-async def delnote(ctx: commands.Context, target: str = None, note_id: int = None):
-    if target is None or note_id is None:
-        return await ctx.send(embed=usage_embed("?delnote", "?delnote <user> <note-id>", "?delnote @User 1"))
-    member = await resolve_member(ctx, target)
-    if not member:
-        await ctx.send(f"{EMOJI_DENEGADO} User not found.")
-        return
-
-    result = await db.notes.delete_one({
-        "guild_id": ctx.guild.id,
-        "user_id": member.id,
-        "note_id": note_id
-    })
-
-    if result.deleted_count == 0:
-        await ctx.send(f"{EMOJI_DENEGADO} Note ID not found.")
-        return
-
-    await ctx.send(f"{EMOJI_ACEPTAR} Note `{note_id}` deleted from **{member}**.")
-
-# ==================== UTILITY COMMANDS ====================
-@bot.command(name="slowmode")
-@commands.has_permissions(manage_channels=True)
-@commands.bot_has_permissions(manage_channels=True)
-async def slowmode(ctx: commands.Context, channel: Optional[discord.TextChannel] = None, time: Optional[str] = None):
-    channel = channel or ctx.channel
-    if time is None:
-        await channel.edit(slowmode_delay=0)
-        await ctx.send(f"{EMOJI_ACEPTAR} Slowmode disabled in {channel.mention}.")
-        return
-
-    td = parse_time(time)
-    if not td:
-        try:
-            seconds = int(time)
-        except ValueError:
-            await ctx.send(f"{EMOJI_DENEGADO} Invalid time. Use `5s`, `10m`, `1h` or seconds.")
-            return
-    else:
-        seconds = int(td.total_seconds())
-
-    if seconds > 21600:
-        await ctx.send(f"{EMOJI_DENEGADO} Slowmode cannot be higher than 6 hours.")
-        return
-
-    await channel.edit(slowmode_delay=seconds)
-    await ctx.send(f"{EMOJI_RELOJ} Slowmode set to **{seconds}s** in {channel.mention}.")
-
-@bot.command(name="clear")
-@commands.has_permissions(manage_messages=True)
-@commands.bot_has_permissions(manage_messages=True)
-async def clear(ctx: commands.Context, amount: int = None):
-    if amount is None:
-        return await ctx.send(embed=usage_embed("?clear", "?clear <amount>", "?clear 20"))
-    if amount < 1 or amount > 100:
-        await ctx.send(f"{EMOJI_DENEGADO} Amount must be between 1 and 100.")
-        return
-    deleted = await ctx.channel.purge(limit=amount + 1)
-    await ctx.send(f"{EMOJI_ACEPTAR} Deleted **{len(deleted)-1}** messages.", delete_after=5)
-
-@bot.command(name="dm")
-@commands.has_permissions(moderate_members=True)
-async def dm(ctx: commands.Context, target: str = None, *, message: str = None):
-    if target is None or message is None:
-        return await ctx.send(embed=usage_embed("?dm", "?dm <user> <message>", "?dm @User Please read the rules"))
-    member = await resolve_member(ctx, target)
-    if not member:
-        await ctx.send(f"{EMOJI_DENEGADO} User not found.")
-        return
-    try:
-        embed = discord.Embed(
-            title=f"{EMOJI_PLUMA} Message from Staff Team",
-            description=message,
-            color=SYSTEM_COLOR,
-            timestamp=datetime.now(timezone.utc)
-        )
-        embed.set_footer(text="My Dino Park • Staff Team")
-        await member.send(embed=embed)
-        await ctx.send(f"{EMOJI_ACEPTAR} DM sent to **{member}**.")
-    except discord.Forbidden:
-        await ctx.send(f"{EMOJI_DENEGADO} I couldn't send the DM (user has DMs closed).")
-
-@bot.command(name="addrole")
-@commands.has_permissions(manage_roles=True)
-@commands.bot_has_permissions(manage_roles=True)
-async def addrole(ctx: commands.Context, target: str = None, role: str = None):
-    if target is None or role is None:
-        return await ctx.send(embed=usage_embed("?addrole", "?addrole <user> <role>", "?addrole @User @Member"))
-    member = await resolve_member(ctx, target)
-    role_obj = await resolve_role(ctx, role)
-    if not member or not role_obj:
-        await ctx.send(f"{EMOJI_DENEGADO} User or role not found.")
-        return
-    if role_obj >= ctx.author.top_role and ctx.author.id != ctx.guild.owner_id:
-        await ctx.send(f"{EMOJI_DENEGADO} You cannot assign a role equal or higher than yours.")
-        return
-    if role_obj >= ctx.guild.me.top_role:
-        await ctx.send(f"{EMOJI_DENEGADO} I cannot assign a role higher than my highest role.")
-        return
-    await member.add_roles(role_obj, reason=f"Added by {ctx.author}")
-    await ctx.send(f"{EMOJI_ACEPTAR} Role {role_obj.mention} added to **{member}**.")
-
-@bot.command(name="removerole")
-@commands.has_permissions(manage_roles=True)
-@commands.bot_has_permissions(manage_roles=True)
-async def removerole(ctx: commands.Context, target: str = None, role: str = None):
-    if target is None or role is None:
-        return await ctx.send(embed=usage_embed("?removerole", "?removerole <user> <role>", "?removerole @User @Member"))
-    member = await resolve_member(ctx, target)
-    role_obj = await resolve_role(ctx, role)
-    if not member or not role_obj:
-        await ctx.send(f"{EMOJI_DENEGADO} User or role not found.")
-        return
-    if role_obj >= ctx.author.top_role and ctx.author.id != ctx.guild.owner_id:
-        await ctx.send(f"{EMOJI_DENEGADO} You cannot remove a role equal or higher than yours.")
-        return
-    await member.remove_roles(role_obj, reason=f"Removed by {ctx.author}")
-    await ctx.send(f"{EMOJI_ACEPTAR} Role {role_obj.mention} removed from **{member}**.")
-
-@bot.command(name="nick")
-@commands.has_permissions(manage_nicknames=True)
-@commands.bot_has_permissions(manage_nicknames=True)
-async def nick(ctx: commands.Context, target: str = None, *, new_nick: str = None):
-    if target is None:
-        return await ctx.send(embed=usage_embed("?nick", "?nick <user> [new nick]", "?nick @User CoolName"))
-    member = await resolve_member(ctx, target)
-    if not member:
-        await ctx.send(f"{EMOJI_DENEGADO} User not found.")
-        return
-    if not can_moderate(ctx.author, member) and ctx.author.id != ctx.guild.owner_id:
-        await ctx.send(f"{EMOJI_DENEGADO} You cannot change this user's nickname (hierarchy).")
-        return
-    try:
-        await member.edit(nick=new_nick)
-        if new_nick:
-            await ctx.send(f"{EMOJI_ACEPTAR} Nickname of **{member}** changed to `{new_nick}`.")
-        else:
-            await ctx.send(f"{EMOJI_ACEPTAR} Nickname of **{member}** has been reset.")
-    except discord.Forbidden:
-        await ctx.send(f"{EMOJI_DENEGADO} I don't have permission to change this nickname.")
-
-@bot.command(name="userinfo")
-async def userinfo(ctx: commands.Context, target: str = None):
-    if target is None:
-        member = ctx.author
-    else:
-        member = await resolve_member(ctx, target)
-        if not member:
-            await ctx.send(f"{EMOJI_DENEGADO} User not found.")
-            return
-
-    roles = [r.mention for r in member.roles if r != ctx.guild.default_role]
-    roles_text = ", ".join(roles[:15]) if roles else "None"
-    if len(roles) > 15:
-        roles_text += f" (+{len(roles)-15} more)"
-
-    embed = discord.Embed(title=f"{EMOJI_LUPA} User Info — {member}", color=SYSTEM_COLOR, timestamp=datetime.now(timezone.utc))
-    embed.set_thumbnail(url=member.display_avatar.url)
-    embed.add_field(name="ID", value=f"`{member.id}`", inline=True)
-    embed.add_field(name="Nickname", value=member.nick or "None", inline=True)
-    embed.add_field(name="Bot", value="Yes" if member.bot else "No", inline=True)
-    embed.add_field(name="Account Created", value=discord.utils.format_dt(member.created_at, "R"), inline=True)
-    embed.add_field(name="Joined Server", value=discord.utils.format_dt(member.joined_at, "R") if member.joined_at else "Unknown", inline=True)
-    embed.add_field(name="Roles", value=roles_text, inline=False)
-    embed.set_footer(text=f"Requested by {ctx.author}")
-    await ctx.send(embed=embed)
-
-@bot.command(name="cmds")
-async def cmds(ctx: commands.Context):
-    embed = discord.Embed(
-        title=f"{EMOJI_LUPA} MydinoBot Commands",
-        description="Prefix: `?`  •  Case-insensitive",
-        color=SYSTEM_COLOR
-    )
-    embed.add_field(
-        name="Moderation",
-        value=(
-            "`?lock` `?unlock` `?ban` `?tempban`\n"
-            "`?unban` `?warn` `?warnings` `?delwarn`\n"
-            "`?note` `?viewnotes` `?delnote`\n"
-            "`?slowmode` `?clear`"
-        ),
-        inline=True
-    )
-    embed.add_field(
-        name="Utility",
-        value=(
-            "`?dm` `?addrole` `?removerole`\n"
-            "`?nick` `?userinfo` `?cmds`"
-        ),
-        inline=True
-    )
-    embed.add_field(
-        name="Admin (Slash)",
-        value="`/welcome-setup`\n`/bot-setup`",
-        inline=True
-    )
-    embed.add_field(name="Time Format", value="`30s` `5m` `2h` `1d` `1w`", inline=False)
-    embed.set_footer(text="My Dino Park")
-    await ctx.send(embed=embed)
-
 # ==================== ERROR HANDLING ====================
 @bot.event
 async def on_command_error(ctx: commands.Context, error: Exception):
@@ -1029,6 +498,28 @@ async def on_ready():
     except Exception as e:
         print(f"Failed to connect to MongoDB: {e}")
         return
+
+    # Adjuntar helpers y DB al bot para que commands.py pueda usarlos
+    bot.db = db
+    bot.parse_time = parse_time
+    bot.format_timedelta = format_timedelta
+    bot.resolve_member = resolve_member
+    bot.resolve_role = resolve_role
+    bot.can_moderate = can_moderate
+    bot.send_dm_sanction = send_dm_sanction
+    bot.log_action = log_action
+    bot.usage_embed = usage_embed
+    bot.SYSTEM_COLOR = SYSTEM_COLOR
+    bot.EMOJI_LUPA = EMOJI_LUPA
+    bot.EMOJI_DENEGADO = EMOJI_DENEGADO
+    bot.EMOJI_RELOJ = EMOJI_RELOJ
+    bot.EMOJI_ARENA = EMOJI_ARENA
+    bot.EMOJI_ACEPTAR = EMOJI_ACEPTAR
+    bot.EMOJI_AVISO = EMOJI_AVISO
+    bot.EMOJI_PLUMA = EMOJI_PLUMA
+
+    # Cargar todos los comandos
+    bot_commands.setup(bot)
 
     try:
         synced = await bot.tree.sync()
